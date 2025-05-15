@@ -2,15 +2,20 @@
 pragma solidity ^0.8.0;
 
 contract Lottery {
-    uint8 constant public minNumber = 1;
-    uint8 constant public maxNumber = 15;
-    uint8 constant public numbersLength = 4;
-    uint256 constant public ticketPrice = 0.01 ether;
-    uint256 constant public drawDuration = 1 days;
+    uint8 constant public MIN_NUMBER = 1;
+    uint8 constant public MAX_NUMBER = 15;
+    uint8 constant public NUMBERS_LENGTH = 4;
+    uint256 constant public TICKET_PRICE = 0.01 ether;
+    uint256 constant public COMMIT_DURATION = 12 hours;
+    uint256 public constant REVEAL_DURATION = 12 hours;
 
+    
     struct Ticket {
         address player;
         uint8[4] numbers;
+        bytes32 seedCommitment;
+        uint256 seed; 
+        bool revealed;
     }
     struct Draw {
         uint256 drawId;
@@ -27,80 +32,120 @@ contract Lottery {
     uint256 public currentPrizePool;
     mapping(uint256 => Draw) public draws;
     mapping(uint256 => Ticket[]) public tickets;
+    mapping(address => uint256) public pendingWithdrawals;
 
-    event TicketPurchased(uint256 indexed drawId, address indexed player, uint8[numbersLength] numbers);
-    event DrawCompleted(uint256 indexed drawId, uint8[numbersLength] winningNumbers, uint256 prizePool);
+    enum DrawState{Commit, Reveal,Completed}
+    DrawState public currentState;
 
-    modifier onlyOwner() {
+    event TicketPurchased(uint256 indexed drawId, address indexed player, uint8[NUMBERS_LENGTH] numbers,bytes32 seedCommitHash);
+    event DrawCompleted(uint256 indexed drawId, uint8[NUMBERS_LENGTH] winningNumbers, uint256 prizePool);
+    event PrizeDistributed(uint256 indexed drawId, address indexed winner, uint256 amount);
+    event SeedRevealed(uint256 indexed drawId, address indexed player, uint256 seed);
+
+    modifier onlyOwner() { 
         require(msg.sender == GM, "Only owner can call this function");
-        _;
-    }
-
-    modifier activeDraw() {
-        require(block.timestamp < drawStartTime + drawDuration, "Draw has ended");
-        _;
+        _; 
     }
 
     constructor() {
         GM = msg.sender;
         currentDrawId = 0;
+        draws[currentDrawId].drawId = currentDrawId;
         drawStartTime = block.timestamp;
+        currentState = DrawState.Commit;
         currentPrizePool = 0;
+
     }
 
-    function buyTicket(uint8[numbersLength] memory _numbers) external payable activeDraw {
-        require(msg.value == ticketPrice, "Incorrect ticket price");
-        require(_numbers.length == numbersLength, "Must select 4 numbers");
+    function buyTicket(uint8[NUMBERS_LENGTH] memory _numbers, bytes32 seedCommitHash) external payable {
+        require(currentState == DrawState.Commit, "Not in commit phase");
+        require(msg.value == TICKET_PRICE, "Incorrect ticket price");
+        require(_numbers.length == NUMBERS_LENGTH, "Must select 4 numbers");
 
-        for (uint256 i = 0; i < numbersLength; i++) {
-            require(_numbers[i] >= minNumber && _numbers[i] <= maxNumber, "Numbers must be between 1 and 15");
-            for (uint256 j = i + 1; j < numbersLength; j++) {
+        for (uint256 i = 0; i < NUMBERS_LENGTH; i++) {
+            require(_numbers[i] >= MIN_NUMBER && _numbers[i] <= MAX_NUMBER, "Numbers must be between 1 and 15");
+            for (uint256 j = i + 1; j < NUMBERS_LENGTH; j++) {
                 require(_numbers[i] != _numbers[j], "Duplicate numbers not allowed");
             }
         }
 
-        Ticket memory newTicket = Ticket({
-            player: msg.sender,
-            numbers: _numbers
-        });
-
-        tickets[currentDrawId].push(newTicket);
+        tickets[currentDrawId].push(
+            Ticket({
+                player: msg.sender,
+                numbers: _numbers,
+                seedCommitment: seedCommitHash,
+                seed: uint256(0),
+                revealed:false
+            })
+        );
         currentPrizePool += msg.value;
 
-        emit TicketPurchased(currentDrawId, msg.sender, _numbers);
+        emit TicketPurchased(currentDrawId, msg.sender, _numbers,seedCommitHash);
+    }
+
+    function revealSeed(uint256 _ticketIndex, string memory secret, uint256 _seed) external {
+        require(currentState == DrawState.Reveal, "Not in reveal phase");
+        require(block.timestamp >= drawStartTime + COMMIT_DURATION, "Reveal phase not started");
+        require(block.timestamp < drawStartTime + COMMIT_DURATION + REVEAL_DURATION, "Reveal phase ended");
+        require(_ticketIndex < tickets[currentDrawId].length, "Invalid ticket index");
+        require(tickets[currentDrawId][_ticketIndex].player == msg.sender, "Not your ticket");
+        require(!tickets[currentDrawId][_ticketIndex].revealed, "Already revealed");
+
+        // Verify seed commitment
+        bytes32 computedCommitment = calculateCommitHash(secret, _seed);
+        require(computedCommitment == tickets[currentDrawId][_ticketIndex].seedCommitment, "Invalid seed reveal");
+
+        tickets[currentDrawId][_ticketIndex].seed = _seed;
+        tickets[currentDrawId][_ticketIndex].revealed = true;
+
+        emit SeedRevealed(currentDrawId, msg.sender, _seed);
+    }
+
+    function startRevealPhase() external onlyOwner {
+        require(currentState == DrawState.Commit, "Already in reveal phase");
+        require(block.timestamp >= drawStartTime + COMMIT_DURATION, "Commit phase not ended");
+        currentState = DrawState.Reveal;
     }
 
     function drawNumbers() external onlyOwner {
-        require(block.timestamp >= drawStartTime + drawDuration, "Draw not yet completed");
+        require(currentState == DrawState.Reveal, "Not in reveal phase");
+        require(block.timestamp >= drawStartTime + COMMIT_DURATION + REVEAL_DURATION, "Reveal phase not ended");
         require(tickets[currentDrawId].length > 0, "No tickets purchased");
         require(!draws[currentDrawId].completed, "Draw already completed");
 
-        uint8[4] memory winningNumbers;
-        uint256 randomness = uint256(keccak256(abi.encodePacked(block.timestamp, block.prevrandao, msg.sender)));
+        uint256 randomness = 0;
+        uint256 revealCount = 0;
+        for (uint256 i = 0; i < tickets[currentDrawId].length; i++) {
+            if (tickets[currentDrawId][i].revealed) {
+                randomness = uint256(keccak256(abi.encode(randomness, tickets[currentDrawId][i].seed)));
+                revealCount++;
+            }
+        }
 
-        // Generate winning numbers
-        for (uint256 i = 0; i < numbersLength; i++) {
-            uint8 num = uint8((randomness % maxNumber) + 1);
+        uint8[NUMBERS_LENGTH] memory winningNumbers;
+        for (uint256 i = 0; i < NUMBERS_LENGTH; i++) {
+            uint8 num = uint8((randomness % MAX_NUMBER) + 1);
             randomness = uint256(keccak256(abi.encodePacked(randomness)));
             for (uint256 j = 0; j < i; j++) {
                 if (winningNumbers[j] == num) {
-                    num = (num % maxNumber) + 1;
-                    j = 0; // Restart check
+                    num = (num % MAX_NUMBER) + 1;
+                    j = 0; 
                 }
             }
             winningNumbers[i] = num;
         }
 
-        // Update draw state
         draws[currentDrawId].winningNumbers = winningNumbers;
         draws[currentDrawId].completed = true;
         draws[currentDrawId].prizePool = currentPrizePool;
 
-        // Distribute prizes
         uint256 winnerCount = 0;
         for (uint256 i = 0; i < tickets[currentDrawId].length; i++) {
+            if (!tickets[currentDrawId][i].revealed){
+                continue;
+            }
             uint256 matches = countMatches(tickets[currentDrawId][i].numbers, winningNumbers);
-            if (matches == numbersLength){
+            if (matches == NUMBERS_LENGTH){
                 winnerCount++;
             }
         }
@@ -108,21 +153,23 @@ contract Lottery {
         address[] memory winners = new address[](winnerCount);
         uint256 index = 0;
         for (uint256 i = 0; i < tickets[currentDrawId].length; i++) {
+            if (!tickets[currentDrawId][i].revealed){
+                continue;
+            }
             uint256 matches = countMatches(tickets[currentDrawId][i].numbers, winningNumbers);
-            if (matches == numbersLength){
+            if (matches == NUMBERS_LENGTH){
                 winners[index] = tickets[currentDrawId][i].player;
                 index++;
             }
         }
         draws[currentDrawId].winners = winners;
+
         if (winnerCount > 0){
             draws[currentDrawId].hasWinner = true;
             uint256 prizePerWinner = draws[currentDrawId].prizePool / winnerCount;
             for (uint256 i = 0; i < winnerCount; i++) {
-                 (bool success, ) = winners[i].call{value: prizePerWinner}("");
-                 if (success) {
-                    currentPrizePool -= prizePerWinner;
-                }
+                pendingWithdrawals[winners[i]] += prizePerWinner;
+                emit PrizeDistributed(currentDrawId, winners[i], prizePerWinner);
             }
             currentPrizePool = 0;
         }
@@ -131,12 +178,24 @@ contract Lottery {
         currentDrawId++;
         drawStartTime = block.timestamp;
         draws[currentDrawId].drawId = currentDrawId;
+        currentState = DrawState.Commit;
     }
 
-    function countMatches(uint8[4] memory _ticketNumbers, uint8[numbersLength] memory _winningNumbers) internal pure returns (uint256) {
+    function withdrawPrize() external {
+        uint256 amount = pendingWithdrawals[msg.sender];
+        require(amount > 0, "No prize to withdraw");
+
+        (bool success, ) = msg.sender.call{value: amount}("");
+        if (success){
+            pendingWithdrawals[msg.sender] = 0;
+        }
+        require(success, "Transfer failed");
+    }
+
+    function countMatches(uint8[4] memory _ticketNumbers, uint8[NUMBERS_LENGTH] memory _winningNumbers) internal pure returns (uint256) {
         uint256 matches = 0;
-        for (uint256 i = 0; i < numbersLength; i++) {
-            for (uint256 j = 0; j < numbersLength; j++) {
+        for (uint256 i = 0; i < NUMBERS_LENGTH; i++) {
+            for (uint256 j = 0; j < NUMBERS_LENGTH; j++) {
                 if (_ticketNumbers[i] == _winningNumbers[j]) {
                     matches++;
                 }
@@ -150,18 +209,21 @@ contract Lottery {
         view
         returns (
             address player,
-            uint8[numbersLength] memory numbers
+            uint8[NUMBERS_LENGTH] memory numbers,
+            bytes32 seedCommitment,
+            uint256 seed,
+            bool revealed
         )
     {
         Ticket storage ticket = tickets[_drawId][_ticketIndex];
-        return (ticket.player, ticket.numbers);
+        return (ticket.player, ticket.numbers, ticket.seedCommitment, ticket.seed, ticket.revealed);
     }
 
     function getDrawDetails(uint256 _drawId)
         external
         view
         returns (
-            uint8[numbersLength] memory winningNumbers,
+            uint8[NUMBERS_LENGTH] memory winningNumbers,
             uint256 prizePool,
             bool completed,
             bool hasWinner,
@@ -172,4 +234,7 @@ contract Lottery {
         return (draw.winningNumbers, draw.prizePool, draw.completed, draw.hasWinner,draw.winners);
     }
 
+    function calculateCommitHash(string memory secret, uint256 randomness) public pure returns (bytes32) {
+        return keccak256(abi.encodePacked(secret, randomness));
+    }
 }
