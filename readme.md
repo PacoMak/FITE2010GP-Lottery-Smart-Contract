@@ -24,7 +24,7 @@ you may run testing by
    - Players select 4 unique numbers between 1 and 15.
    - Players provide a seed commitment (hash) during the commit phase.
 
-2. **Ticket Reveal **:
+2. **Ticket Reveal**:
    - After the commit phase, a 12-hour reveal phase begins.
    - Players must reveal their seed, which must match the commitment hash provided during purchase.
    - Unrevealed tickets are ineligible for prizes, and the ticket price is not refunded.
